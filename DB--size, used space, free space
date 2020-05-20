@@ -3,7 +3,7 @@
 --GO
 
 --https://www.sqlservercentral.com/scripts/get-database-size-used-space-free-space
-====================================================
+---====================================================
 USE [master]
 GO
 /****** 
