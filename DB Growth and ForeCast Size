@@ -1,0 +1,471 @@
+--Database growth and forecasting future database size
+
+--https://siddsqlsolution.blogspot.com/2017/01/sql-server-script-to-retrieve-database.html
+--By Siddharth Chauhan January 02, 2017
+--This script gets the growth trend of a database’s data file (only) on the basis of its last six month backup history (from msdb). 
+--Then it predicts database’s future data file size on two parameters i.e. 
+--how much percentage growth is attained by data file in total in last six months as well as how much average percentage growth is attained by data file in every month. 
+--By default it predicts growth of database file for next one year. You can use variable “@fc_period” to predict growth for more than one year as well, 
+--however I think going beyond two years would not be as fruitful. 
+--In case you’re wondering why data file only then the answer is that log file size is subjective depends more on transaction load and backup frequency then on data size alone.
+
+use [msdb]
+set nocount on
+create table #db_backups
+(
+       database_name varchar(255),
+       db_creation_date datetime,
+       backup_date datetime,
+       db_file_type char(1),
+       db_file_size_in_mb bigint
+)
+create nonclustered index [nidx_db_backups_dbname_backupdate] on #db_backups
+(
+       database_name,
+       backup_date,
+       db_file_type
+)include(db_file_size_in_mb)
+
+create table #db_backups_eval
+(
+       database_name varchar(255),
+       db_creation_date datetime,
+       backup_date_strt datetime,
+       backup_date_end datetime,
+       db_file_size_in_mb_strt bigint,
+       db_file_size_in_mb_end bigint,
+       eval_period_type varchar(100),
+       eval_period tinyint,
+       percentage_growth decimal(20,3)
+)
+
+insert into #db_backups
+select bs.database_name, bs.database_creation_date, bs.backup_finish_date as "Backup_Date"
+, bf.file_type,((bf.file_size)/1024/1024) as "DB_file_size_in_mb"
+from backupfile bf join backupset bs
+on bf.backup_set_id = bs.backup_set_id
+where backup_finish_date > DATEADD(day,-181,getdate())
+order by backup_finish_date;
+
+declare @dbname varchar(255), @db_crt_date datetime;
+
+declare cur_dbs cursor
+fast_forward
+for
+select name, create_date from master.sys.databases
+where name not in ('master','msdb','model','tempdb');
+
+
+open cur_dbs;
+
+fetch next from cur_dbs into @dbname, @db_crt_date;
+
+while @@FETCH_STATUS = 0
+begin
+
+       declare @file_size_str bigint, @file_size_end bigint, @prct decimal(20,3), @mthl_avg_str_dt datetime;
+       declare @str_bd_date datetime, @end_bd_date datetime, @count int, @fc_period int = 1, @avg_str_bit bit;
+      
+       set @file_size_str = 0;
+       set @file_size_end = 0;
+       set @count = 0;
+       set @avg_str_bit = 0;
+             
+       print 'Getting values for database : ' + @dbname;
+
+       --Calculation for six months
+       select @str_bd_date = min(backup_date), @end_bd_date = max(backup_date) from #db_backups
+       where database_name = @dbname and backup_date < getdate() and db_file_type = 'D';
+
+       set @mthl_avg_str_dt = @str_bd_date;
+      
+       if not ( @str_bd_date is null or @end_bd_date is null)
+       begin
+
+              select @file_size_str = SUM(db_file_size_in_mb) from #db_backups
+              where database_name = @dbname
+              and backup_date = @str_bd_date
+              and db_file_type = 'D';
+      
+              select @file_size_end = SUM(db_file_size_in_mb) from #db_backups
+              where database_name = @dbname
+              and backup_date = @end_bd_date
+              and db_file_type = 'D';
+      
+              set @prct = ((convert(decimal(20,3),@file_size_end) / (convert(decimal(20,3),@file_size_str))) - 1) * 100;
+      
+              insert into #db_backups_eval
+              select @dbname, @db_crt_date, @str_bd_date, @end_bd_date, @file_size_str, @file_size_end,
+              'Database Growth in last 6 months', 6, @prct;
+      
+       end
+       else
+       begin
+
+              insert into #db_backups_eval
+              select @dbname, @db_crt_date, @str_bd_date, @end_bd_date, @file_size_str, @file_size_end,
+              'enough backup information not available', 6, 0.000;
+
+              goto skipped;
+
+       end
+      
+       --Calculation for quaterly
+      
+       --Quarter one
+      
+       select @str_bd_date = min(backup_date) from #db_backups
+       where database_name = @dbname and backup_date < getdate() and db_file_type = 'D';
+      
+       select @end_bd_date = max(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date between DATEADD(day,-100,getdate()) and DATEADD(day,-90,getdate())
+       and db_file_type = 'D';
+      
+       if not ( @str_bd_date is null or @end_bd_date is null)
+       begin
+
+              select @file_size_str = SUM(db_file_size_in_mb) from #db_backups
+              where database_name = @dbname
+              and backup_date = @str_bd_date
+              and db_file_type = 'D';
+      
+              select @file_size_end = SUM(db_file_size_in_mb) from #db_backups
+              where database_name = @dbname
+              and backup_date = @end_bd_date
+              and db_file_type = 'D';
+      
+              set @prct = ((convert(decimal(20,3),@file_size_end) / (convert(decimal(20,3),@file_size_str))) - 1) * 100;
+      
+              insert into #db_backups_eval
+              select @dbname, @db_crt_date, @str_bd_date, @end_bd_date, @file_size_str, @file_size_end,
+              'Quaterly database growth (in 1st Quarter of last 6 months)', 3, @prct;
+      
+       end
+      
+       --Quarter two
+      
+       select @str_bd_date = @end_bd_date;
+      
+       select @end_bd_date = max(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date > DATEADD(day,-79,getdate())
+       and db_file_type = 'D';
+      
+       if not ( @str_bd_date is null or @end_bd_date is null)
+       begin
+      
+              select @file_size_str = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @str_bd_date
+              and db_file_type = 'D';
+      
+              select @file_size_end = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @end_bd_date
+              and db_file_type = 'D';
+      
+              set @prct = ((convert(decimal(20,3),@file_size_end) / (convert(decimal(20,3),@file_size_str))) - 1) * 100;
+      
+              insert into #db_backups_eval
+              select @dbname, @db_crt_date, @str_bd_date, @end_bd_date, @file_size_str, @file_size_end,
+              'Quaterly database growth (in 2nd Quarter of last 6 months)', 3, @prct;
+      
+       end
+       --Calculation for monthly
+      
+       --first month
+      
+       select @str_bd_date = min(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date between DATEADD(day,-180,getdate()) and DATEADD(day,-150,getdate())
+       and db_file_type = 'D';
+      
+       select @end_bd_date = max(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date between DATEADD(day,-180,getdate()) and DATEADD(day,-150,getdate())
+       and db_file_type = 'D';
+      
+       if not ( @str_bd_date is null or @end_bd_date is null)
+       begin
+
+              set @avg_str_bit = 1;
+
+              set @mthl_avg_str_dt = @str_bd_date;
+
+              select @file_size_str = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @str_bd_date
+              and db_file_type = 'D';
+      
+              select @file_size_end = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @end_bd_date
+              and db_file_type = 'D';
+      
+              set @prct = ((convert(decimal(20,3),@file_size_end) / (convert(decimal(20,3),@file_size_str))) - 1) * 100;
+      
+              insert into #db_backups_eval
+              select @dbname, @db_crt_date, @str_bd_date, @end_bd_date, @file_size_str, @file_size_end,
+              'Monthly database growth (in 1st month of last 6 months)', 1, @prct;
+      
+       end
+       --second month
+      
+       select @str_bd_date = min(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date between DATEADD(day,-149,getdate()) and DATEADD(day,-120,getdate())
+       and db_file_type = 'D';
+      
+       select @end_bd_date = max(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date between DATEADD(day,-149,getdate()) and DATEADD(day,-120,getdate())
+       and db_file_type = 'D';
+      
+       if not ( @str_bd_date is null or @end_bd_date is null)
+       begin
+             
+              if (@avg_str_bit = 0)
+              begin
+                     set @avg_str_bit = 1;
+
+                     set @mthl_avg_str_dt = @str_bd_date;
+              end
+      
+              select @file_size_str = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @str_bd_date
+              and db_file_type = 'D';
+      
+              select @file_size_end = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @end_bd_date
+              and db_file_type = 'D';
+      
+              set @prct = ((convert(decimal(20,3),@file_size_end) / (convert(decimal(20,3),@file_size_str))) - 1) * 100;
+      
+              insert into #db_backups_eval
+              select @dbname, @db_crt_date, @str_bd_date, @end_bd_date, @file_size_str, @file_size_end,
+              'Monthly database growth (in 2nd month of last 6 months)', 1, @prct;
+      
+       end
+       --third month
+      
+       select @str_bd_date = min(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date between DATEADD(day,-119,getdate()) and DATEADD(day,-90,getdate())
+       and db_file_type = 'D';
+      
+       select @end_bd_date = max(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date between DATEADD(day,-119,getdate()) and DATEADD(day,-90,getdate())
+       and db_file_type = 'D';
+      
+       if not ( @str_bd_date is null or @end_bd_date is null)
+       begin
+             
+              if (@avg_str_bit = 0)
+              begin
+                     set @avg_str_bit = 1;
+
+                     set @mthl_avg_str_dt = @str_bd_date;
+              end
+
+              select @file_size_str = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @str_bd_date
+              and db_file_type = 'D';
+      
+              select @file_size_end = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @end_bd_date
+              and db_file_type = 'D';
+      
+              set @prct = ((convert(decimal(20,3),@file_size_end) / (convert(decimal(20,3),@file_size_str))) - 1) * 100;
+      
+              insert into #db_backups_eval
+              select @dbname, @db_crt_date, @str_bd_date, @end_bd_date, @file_size_str, @file_size_end,
+              'Monthly database growth (in 3rd month of last 6 months)', 1, @prct;
+      
+       end
+       --fourth month
+      
+       select @str_bd_date = min(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date between DATEADD(day,-89,getdate()) and DATEADD(day,-60,getdate())
+       and db_file_type = 'D';
+      
+       select @end_bd_date = max(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date between DATEADD(day,-89,getdate()) and DATEADD(day,-60,getdate())
+       and db_file_type = 'D';
+      
+       if not ( @str_bd_date is null or @end_bd_date is null)
+       begin
+
+              if (@avg_str_bit = 0)
+              begin
+                     set @avg_str_bit = 1;
+
+                     set @mthl_avg_str_dt = @str_bd_date;
+              end
+
+              select @file_size_str = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @str_bd_date
+              and db_file_type = 'D';
+      
+              select @file_size_end = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @end_bd_date
+              and db_file_type = 'D';
+      
+              set @prct = ((convert(decimal(20,3),@file_size_end) / (convert(decimal(20,3),@file_size_str))) - 1) * 100;
+      
+              insert into #db_backups_eval
+              select @dbname, @db_crt_date, @str_bd_date, @end_bd_date, @file_size_str, @file_size_end,
+              'Monthly database growth (in 4th month of last 6 months)', 1, @prct;
+      
+       end
+       --fifth month
+      
+       select @str_bd_date = min(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date between DATEADD(day,-59,getdate()) and DATEADD(day,-30,getdate())
+       and db_file_type = 'D';
+      
+       select @end_bd_date = max(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date between DATEADD(day,-59,getdate()) and DATEADD(day,-30,getdate())
+       and db_file_type = 'D';
+      
+       if not ( @str_bd_date is null or @end_bd_date is null)
+       begin
+
+              if (@avg_str_bit = 0)
+              begin
+                     set @avg_str_bit = 1;
+
+                     set @mthl_avg_str_dt = @str_bd_date;
+              end
+
+              select @file_size_str = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @str_bd_date
+              and db_file_type = 'D';
+      
+              select @file_size_end = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @end_bd_date
+              and db_file_type = 'D';
+      
+              set @prct = ((convert(decimal(20,3),@file_size_end) / (convert(decimal(20,3),@file_size_str))) - 1) * 100;
+      
+              insert into #db_backups_eval
+              select @dbname, @db_crt_date, @str_bd_date, @end_bd_date, @file_size_str, @file_size_end,
+              'Monthly database growth (in 5th month of last 6 months)', 1, @prct;
+      
+       end
+       --sixth month
+      
+       select @str_bd_date = min(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date between DATEADD(day,-29,getdate()) and getdate()
+       and db_file_type = 'D';
+      
+       select @end_bd_date = max(backup_date) from #db_backups
+       where database_name = @dbname
+       and backup_date between DATEADD(day,-29,getdate()) and getdate()
+       and db_file_type = 'D';
+      
+       if not ( @str_bd_date is null or @end_bd_date is null)
+       begin
+             
+              if (@avg_str_bit = 0)
+              begin
+                     set @avg_str_bit = 1;
+
+                     set @mthl_avg_str_dt = @str_bd_date;
+              end
+
+              select @file_size_str = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @str_bd_date
+              and db_file_type = 'D';
+      
+              select @file_size_end = SUM(db_file_size_in_mb) from #db_backups where database_name = @dbname
+              and backup_date = @end_bd_date
+              and db_file_type = 'D';
+      
+              set @prct = ((convert(decimal(20,3),@file_size_end) / (convert(decimal(20,3),@file_size_str))) - 1) * 100;
+      
+              insert into #db_backups_eval
+              select @dbname, @db_crt_date, @str_bd_date, @end_bd_date, @file_size_str, @file_size_end,
+              'Monthly database growth (in 6th month of last 6 months)', 1, @prct;
+      
+       end
+      
+      
+       --forecasting on the basis of 6 months cumulative growth
+
+       select @file_size_end = db_file_size_in_mb_end, @prct = percentage_growth
+       from #db_backups_eval where database_name = @dbname and eval_period = 6;
+
+       set @prct = @prct / 100;
+
+       while @count < (@fc_period * 2)
+       begin
+              set @file_size_end = @file_size_end * (1 + @prct);
+              set @count = @count + 1;
+       end
+             
+       set @count = 0;
+
+       insert into #db_backups_eval
+       select database_name,db_creation_date, backup_date_end, dateadd(year,@fc_period,backup_date_end)
+       , db_file_size_in_mb_strt, @file_size_end,
+       'Next "'+convert(varchar,@fc_period)+' yr(s)" forecasting on basis of last 6 months cumulative growth'
+       , 6, percentage_growth
+       from #db_backups_eval where database_name = @dbname and eval_period = 6;
+
+      
+      
+       --forecasting on the basis of monthly average growth
+
+       select @file_size_end = db_file_size_in_mb_end, @end_bd_date = backup_date_end
+       from #db_backups_eval where database_name = @dbname and
+       eval_period_type = 'Monthly database growth (in 6th month of last 6 months)';
+
+       select @prct = avg(percentage_growth)
+       from #db_backups_eval where database_name = @dbname and eval_period = 1;
+
+       set @prct = @prct / 100;
+
+       while @count < (@fc_period * 12)
+       begin
+              set @file_size_end = @file_size_end * (1 + @prct);
+              set @count = @count + 1;
+       end
+             
+       set @count = 0;
+
+       insert into #db_backups_eval
+       select distinct database_name,db_creation_date, backup_date_end, dateadd(year,@fc_period,@end_bd_date)
+       , db_file_size_in_mb_strt, @file_size_end,
+       'Next "'+convert(varchar,@fc_period)+' yr(s)" forecasting on basis of monthly average growth'
+       , 6, @prct * 100
+       from #db_backups_eval where database_name = @dbname and
+       eval_period_type = 'Monthly database growth (in 6th month of last 6 months)';;
+      
+
+       skipped:
+       fetch next from cur_dbs into @dbname, @db_crt_date;   
+      
+end
+
+close cur_dbs;
+deallocate cur_dbs;
+
+select  database_name ,    db_creation_date , backup_date_strt , backup_date_end ,       db_file_size_in_mb_strt ,
+              db_file_size_in_mb_end , eval_period_type ,    
+              (db_file_size_in_mb_end - db_file_size_in_mb_strt) as "Total_Growth_in_mb" , percentage_growth
+              from #db_backups_eval
+              where eval_period = 6 and (percentage_growth > 0.000 and percentage_growth is not null)
+              order by database_name;
+
+drop table #db_backups;
+drop table #db_backups_eval;
+
+
+--You can omit "eval_period = 6" clause from the last select statement to see all growth evaluations done by the script. 
+--Please note that forecasting is done on the basis of growth percentage and hence it can show very high figures for databases, 
+--which are created recently i.e. within the 6 month evaluation period and loaded with high amount of data within few days, so you can exclude such databases from your list if you want.
+
+
